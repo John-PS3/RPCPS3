@@ -5497,7 +5497,7 @@ auto STFDX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	PPU_WRITE(f64, vm::cast(addr), ppu.fpr[op.frs]);
+	vm::_ref<f64>(vm::cast(addr)) = ppu.fpr[op.frs];
 	};
 	RETURN_(ppu, op);
 }
@@ -5510,7 +5510,7 @@ auto STFDUX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
-	PPU_WRITE(f64, vm::cast(addr), ppu.fpr[op.frs]);
+	vm::_ref<f64>(vm::cast(addr)) = ppu.fpr[op.frs];
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
