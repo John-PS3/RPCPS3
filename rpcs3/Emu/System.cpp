@@ -3005,10 +3005,6 @@ void Emulator::Kill(bool allow_autoexit, bool savestate, savestate_stage* save_s
 
 	if (!IsStopped() && savestate)
 	{
-		if (IsStarting())
-		{
-			return;
-		}
 
 		if (!save_stage || !save_stage->prepared)
 		{

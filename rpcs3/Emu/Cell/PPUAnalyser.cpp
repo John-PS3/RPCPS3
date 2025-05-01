@@ -531,294 +531,6 @@ namespace ppu_patterns
 	};
 }
 
-static constexpr struct const_tag{} is_const;
-static constexpr struct range_tag{} is_range;
-static constexpr struct min_value_tag{} minv;
-static constexpr struct max_value_tag{} maxv;
-static constexpr struct sign_bit_tag{} sign_bitv;
-static constexpr struct load_addr_tag{} load_addrv;
-
-struct reg_state_t
-{
-	u64 ge_than;
-	u64 value_range;
-	u64 bit_range;
-	bool is_loaded; // Is loaded from memory(?) (this includes offsetting from that address)
-	u32 tag;
-
-	// Check if state is a constant value
-	bool operator()(const_tag) const
-	{
-		return !is_loaded && value_range == 1 && bit_range == 0;
-	}
-
-	// Check if state is a ranged value
-	bool operator()(range_tag) const
-	{
-		return !is_loaded && bit_range == 0;
-	}
-
-	// Get minimum bound
-	u64 operator()(min_value_tag) const
-	{
-		return value_range ? ge_than : 0;
-	}
-
-	// Get maximum bound
-	u64 operator()(max_value_tag) const
-	{
-		return value_range ? (ge_than | bit_range) + value_range : 0;
-	}
-
-	u64 operator()(sign_bit_tag) const
-	{
-		return value_range == 0 || (bit_range >> 63) || (ge_than + value_range - 1) >> 63 != (ge_than >> 63) ? u64{umax} : (ge_than >> 63);
-	}
-
-	u64 operator()(load_addr_tag) const
-	{
-		return is_loaded ? ge_than : 0;
-	}
-
-	// Check if value is of the same origin
-	bool is_equals(const reg_state_t& rhs) const
-	{
-		return (rhs.tag && rhs.tag == this->tag) || (rhs(is_const) && (*this)(is_const) && rhs.ge_than == ge_than);
-	}
-
-	void set_lower_bound(u64 value)
-	{
-		const u64 prev_max = ge_than + value_range;
-		ge_than = value;
-		value_range = prev_max - ge_than;
-	}
-
-	// lower_bound = Max(bounds)
-	void lift_lower_bound(u64 value)
-	{
-		const u64 prev_max = ge_than + value_range;
-
-		// Get the value closer to upper bound (may be lower in value)
-		// Make 0 underflow (it is actually not 0 but UINT64_MAX + 1 in this context)
-		ge_than = value_range - 1 > prev_max - value - 1 ? value : ge_than;
-
-		value_range = prev_max - ge_than;
-	}
-
-	// Upper bound is not inclusive
-	void set_upper_bound(u64 value)
-	{
-		value_range = value - ge_than;
-	}
-
-	// upper_bound = Min(bounds)
-	void limit_upper_bound(u64 value)
-	{
-		// Make 0 underflow (it is actually not 0 but UINT64_MAX + 1 in this context)
-		value_range = std::min(value - ge_than - 1, value_range - 1) + 1;
-	}
-
-	// Clear bits using mask
-	// May fail if ge_than(+)value_range is modified by the operation 
-	bool clear_mask(u64 bit_mask, u32& reg_tag_allocator)
-	{
-		if (bit_mask == umax)
-		{
-			return true;
-		}
-
-		if ((ge_than & bit_mask) > ~value_range)
-		{
-			// Discard data: mask clears the carry bit
-			value_range = 0;
-			tag = reg_tag_allocator++;
-			return false;
-		}
-
-		if (((ge_than & bit_mask) + value_range) & ~bit_mask)
-		{
-			// Discard data: mask clears range bits
-			value_range = 0;
-			tag = reg_tag_allocator++;
-			return false;
-		}
-
-		ge_than &= bit_mask;
-		bit_range &= bit_mask;
-		return true;
-	}
-
-	bool clear_lower_bits(u64 bits, u32& reg_tag_allocator)
-	{
-		const u64 bit_mask = ~((u64{1} << bits) - 1);
-		return clear_mask(bit_mask, reg_tag_allocator);
-	}
-
-	bool clear_higher_bits(u64 bits, u32& reg_tag_allocator)
-	{
-		const u64 bit_mask = (u64{1} << ((64 - bits) % 64)) - 1;
-		return clear_mask(bit_mask, reg_tag_allocator);
-	}
-
-	// Undefine bits using mask
-	void undef_mask(u64 bit_mask)
-	{
-		ge_than &= bit_mask;
-		bit_range |= ~bit_mask;
-	}
-
-	void undef_lower_bits(u64 bits)
-	{
-		const u64 bit_mask = ~((u64{1} << bits) - 1);
-		undef_mask(bit_mask);
-	}
-
-	void undef_higher_bits(u64 bits)
-	{
-		const u64 bit_mask = (u64{1} << ((64 - bits) % 64)) - 1;
-		undef_mask(bit_mask);
-	}
-
-	// Add value to state, respecting of bit_range
-	void add(u64 value)
-	{
-		const u64 old_ge = ge_than;
-		ge_than += value;
-
-		// Adjust bit_range to undefine bits that their state may not be defined anymore
-		// No need to adjust value_range at the moment (wrapping around is implied)
-		bit_range |= ((old_ge | bit_range) + value) ^ ((old_ge) + value);
-
-		ge_than &= ~bit_range;
-	}
-
-	void sub(u64 value)
-	{
-		// This function should be perfect, so it handles subtraction as well
-		add(~value + 1);
-	}
-
-	// TODO: For CMP/CMPD value fixup
-	bool can_subtract_from_both_without_loss_of_meaning(const reg_state_t& rhs, u64 value)
-	{
-		const reg_state_t& lhs = *this;
-
-		return lhs.ge_than >= value && rhs.ge_than >= value && !!((lhs.ge_than - value) & lhs.bit_range) && !!((rhs.ge_than - value) & rhs.bit_range);
-	}
-
-	// Bitwise shift left
-	bool shift_left(u64 value, u32& reg_tag_allocator)
-	{
-		if (!value || !value_range)
-		{
-			return true;
-		}
-
-		const u64 mask_out = u64{umax} >> value;
-
-		if ((ge_than & mask_out) > ~value_range)
-		{
-			// Discard data: shift clears the carry bit
-			value_range = 0;
-			tag = reg_tag_allocator++;
-			return false;
-		}
-
-		if (((ge_than & mask_out) + value_range) & ~mask_out)
-		{
-			// Discard data: shift clears range bits
-			value_range = 0;
-			tag = reg_tag_allocator++;
-			return false;
-		}
-
-		ge_than <<= value;
-		bit_range <<= value;
-		value_range = ((value_range - 1) << value) + 1;
-		return true;
-	}
-
-	void load_const(u64 value)
-	{
-		ge_than = value;
-		value_range = 1;
-		is_loaded = false;
-		tag = 0;
-		bit_range = 0;
-	}
-
-	u64 upper_bound() const
-	{
-		return ge_than + value_range;
-	}
-
-	// Using comparison evaluation data to bound data to our needs
-	void declare_ordering(reg_state_t& right_register, bool lt, bool eq, bool gt, bool so, bool nso)
-	{
-		if (lt && gt)
-		{
-			// We don't care about inequality at the moment
-
-			// Except for 0
-			if (right_register.value_range == 1 && right_register.ge_than == 0)
-			{
-				lift_lower_bound(1);
-			}
-			else if (value_range == 1 && ge_than == 0)
-			{
-				right_register.lift_lower_bound(1);
-			}
-
-			return;
-		}
-
-		if (lt || gt)
-		{
-			reg_state_t* rhs = &right_register;
-			reg_state_t* lhs = this;
-
-			// This is written as if for operator<
-			if (gt)
-			{
-				std::swap(rhs, lhs);
-			}
-
-			if (lhs->value_range == 1)
-			{
-				rhs->lift_lower_bound(lhs->upper_bound() - (eq ? 1 : 0));
-			}
-			else if (rhs->value_range == 1)
-			{
-				lhs->limit_upper_bound(rhs->ge_than + (eq ? 1 : 0));
-			}
-		}
-		else if (eq)
-		{
-			if (value_range == 1)
-			{
-				right_register = *this;
-			}
-			else if (right_register.value_range == 1)
-			{
-				*this = right_register;
-			}
-			else if (0)
-			{
-				// set_lower_bound(std::max(ge_than, right_register.ge_than));
-				// set_upper_bound(std::min(value_range + ge_than, right_register.ge_than + right_register.value_range));
-				// right_register.ge_than = ge_than;
-				// right_register.value_range = value_range;
-			}
-		}
-		else if (so || nso)
-		{
-			// TODO: Implement(?)
-		}
-	}
-};
-
-static constexpr reg_state_t s_reg_const_0{ 0, 1 };
-
 template <>
 bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, const std::vector<u32>& applied, const std::vector<u32>& exported_funcs, std::function<bool()> check_aborted)
 {
@@ -833,16 +545,6 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 	// End of executable segment (may change)
 	u32 end = sec_end ? sec_end : segs[0].addr + segs[0].size;
 
-	// End of all segments
-	u32 segs_end = end;
-
-	for (const auto& s : segs)
-	{
-		if (s.size && s.addr != start)
-		{
-			segs_end = std::max(segs_end, s.addr + s.size);
-		}
-	}
 
 	// Known TOCs (usually only 1)
 	std::unordered_set<u32> TOCs;
@@ -865,13 +567,11 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 	std::vector<std::reference_wrapper<ppu_function_ext>> func_queue;
 
 	// Known references (within segs, addr and value alignment = 4)
-	// For seg0, must be valid code
-	// Value is a sample of an address that refernces it
-	std::map<u32, u32> addr_heap;
+	std::set<u32> addr_heap;
 
 	if (entry)
 	{
-		addr_heap.emplace(entry, 0);
+		addr_heap.emplace(!is_relocatable);
 	}
 
 	auto verify_ref = [&](u32 addr)
@@ -922,48 +622,6 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 		return true;
 	};
 
-	auto is_valid_code = [](std::span<const be_t<u32>> range, bool is_fixed_addr, u32 /*cia*/)
-	{
-		for (usz index = 0; index < std::min<usz>(range.size(), 10); index++)
-		{
-			const ppu_opcode_t op{+range[index]};
-
-			switch (g_ppu_itype.decode(op.opcode))
-			{
-			case ppu_itype::UNK:
-			{
-				return false;
-			}
-			case ppu_itype::BC:
-			case ppu_itype::B:
-			{
-				if (!is_fixed_addr && op.aa)
-				{
-					return false;
-				}
-
-				return true;
-			}
-			case ppu_itype::BCCTR:
-			case ppu_itype::BCLR:
-			{
-				if (op.opcode & 0xe000)
-				{
-					// Garbage filter
-					return false;
-				}
-
-				return true;
-			}
-			default:
-			{
-				continue;
-			}
-			}
-		}
-
-		return true;
-	};
 
 	// Register new function
 	auto add_func = [&](u32 addr, u32 toc, u32 caller) -> ppu_function_ext&
@@ -1869,98 +1527,7 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 			vm::cptr<u32> _ptr = vm::cast(block_addr);
 			auto ptr = ensure(get_ptr<u32>(_ptr));
 
-			auto is_reg_mapped = [&](u32 index)
-			{
-				return !!(block_queue[j].mapped_registers_mask.mask & (u64{1} << index));
-			};
-
-			reg_state_t dummy_state{};
-
-			const auto get_reg = [&](usz index) -> reg_state_t&
-			{
-				block_local_info_t* block = &block_queue[j];
-
-				const usz reg_mask = u64{1} << index;
-
-				if (~block->moved_registers_mask.mask & reg_mask)
-				{
-					if ((j + 1) * 64 >= reg_state_storage.size())
-					{
-						dummy_state.value_range = 0;
-						dummy_state.tag = reg_tag_allocator++;
-						return dummy_state;
-					}
-
-					usz begin_block = umax;
-
-					// Try searching for register origin
-					if (block->mapped_registers_mask.mask & reg_mask)
-				 	{
-				 		for (u32 i = block->parent_block_idx; i != umax; i = block_queue[i].parent_block_idx)
-						{
-							if (~block_queue[i].moved_registers_mask.mask & reg_mask)
-							{
-								continue;
-							}
-
-							begin_block = i;
-							break;
-						}
-					}
-
-					// Initialize register or copy from origin
-					if (begin_block != umax)
-					{
-						reg_state_storage[64 * j + index] = reg_state_storage[64 * begin_block + index];
-					}
-					else
-					{
-						reg_state_storage[64 * j + index] = make_unknown_reg_state();
-					}
-
-					block->mapped_registers_mask.mask |= reg_mask;
-					block->moved_registers_mask.mask |= reg_mask;
-				}
-
-				return reg_state_storage[64 * j + index];
-			};
-
-			const auto store_block_reg = [&](u32 block_index, u32 index, const reg_state_t& rhs)
-			{
-				if ((block_index + 1) * 64 >= reg_state_storage.size())
-				{
-					return;
-				}
-
-				reg_state_storage[64 * block_index + index] = rhs;
-
-				const usz reg_mask = u64{1} << index;
-				block_queue[block_index].mapped_registers_mask.mask |= reg_mask;
-				block_queue[block_index].moved_registers_mask.mask |= reg_mask;
-			};
-
-			const auto unmap_reg = [&](u32 index)
-			{
-				block_local_info_t* block = &block_queue[j];
-
-				const usz reg_mask = u64{1} << index;
-
-				block->mapped_registers_mask.mask &= ~reg_mask;
-				block->moved_registers_mask.mask &= ~reg_mask;
-			};
-
-			enum : u32
-			{
-				c_reg_lr = 32,
-				c_reg_ctr = 33,
-				c_reg_vrsave = 34,
-				c_reg_xer = 35,
-				c_reg_cr0_arg_rhs = 36,
-				c_reg_cr7_arg_rhs = c_reg_cr0_arg_rhs + 7,
-				c_reg_cr0_arg_lhs = 44,
-				c_reg_cr7_arg_lhs = c_reg_cr0_arg_lhs + 7,
-			};
-
+			
 			for (; _ptr.addr() < func_end;)
 			{
 				const u32 iaddr = _ptr.addr();
@@ -2045,77 +1612,6 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 					// Add next block if necessary
 					if ((is_call && !(pfunc->attr & ppu_attr::no_return)) || (type == ppu_itype::BC && (op.bo & 0x14) != 0x14))
 					{
-						const u32 next_idx = add_block(_ptr.addr(), j);
-
-						if (next_idx != umax && target != iaddr + 4 && type == ppu_itype::BC && (op.bo & 0b10100) == 0b00100)
-						{
-							bool lt{};
-							bool gt{};
-							bool eq{};
-							bool so{};
-							bool nso{};
-
-							// Because this is the following instruction, reverse the flags
-							if ((op.bo & 0b01000) != 0)
-							{
-								switch (op.bi % 4)
-								{
-								case 0x0: gt = true; eq = true; break;
-								case 0x1: lt = true; eq = true; break;
-								case 0x2: gt = true; lt = true; break;
-								case 0x3: nso = true; break;
-								default: fmt::throw_exception("Unreachable");
-								}
-							}
-							else
-							{
-								switch (op.bi % 4)
-								{
-								case 0x0: lt = true; break;
-								case 0x1: gt = true; break;
-								case 0x2: eq = true; break;
-								case 0x3: so = true; break;
-								default: fmt::throw_exception("Unreachable");
-								}
-							}
-
-							const u32 rhs_cr_state = c_reg_cr0_arg_rhs + op.bi / 4;
-							const u32 lhs_cr_state = c_reg_cr0_arg_lhs + op.bi / 4;
-
-							// Complete the block information based on the data that the jump is NOT taken
-							// This information would be inherited to next block
-
-							auto lhs_state = get_reg(lhs_cr_state);
-							auto rhs_state = get_reg(rhs_cr_state);
-
-							lhs_state.declare_ordering(rhs_state, lt, eq, gt, so, nso);
-
-							store_block_reg(next_idx, lhs_cr_state, lhs_state);
-							store_block_reg(next_idx, rhs_cr_state, rhs_state);
-
-							const u64 reg_mask = block_queue[j].mapped_registers_mask.mask;
-
-							for (u32 bit = std::countr_zero(reg_mask); bit < 64 && reg_mask & (u64{1} << bit);
-								bit += 1, bit = std::countr_zero(reg_mask >> (bit % 64)) + bit)
-							{
-								if (bit == lhs_cr_state || bit == rhs_cr_state)
-								{
-									continue;
-								}
-
-								auto& reg_state = get_reg(bit);
-
-								if (reg_state.is_equals(lhs_state))
-								{
-									store_block_reg(next_idx, bit, lhs_state);
-								}
-								else if (reg_state.is_equals(rhs_state))
-								{
-									store_block_reg(next_idx, bit, rhs_state);
-								}
-							}
-						}
-					}
 
 					if (is_call && pfunc->attr & ppu_attr::no_return)
 					{
@@ -2166,20 +1662,7 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 						{
 							for (; _ptr.addr() < jt_end; advance(_ptr, ptr, 1))
 							{
-								const u32 addr = (is_relative ? jt_addr : 0) + *ptr;
 
-								if (addr == jt_addr)
-								{
-									// TODO (cannot branch to jumptable itself)
-									return;
-								}
-
-								if (addr % 4 || addr < func.addr || addr >= func_end || !is_valid_code({ get_ptr<u32>(addr), code_end }, !is_relocatable, addr))
-								{
-									return;
-								}
-
-								add_block(addr, j);
 							}
 						};
 
@@ -2194,66 +1677,6 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 
 							if (ctr.is_loaded)
 							{
-								vm::cptr<u32> jumpatble_off = vm::cast(static_cast<u32>(ctr(load_addrv)));
-
-								if (be_t<u32>* jumpatble_ptr_begin = get_ptr<u32>(jumpatble_off))
-								{
-									be_t<u32>* jumpatble_ptr = jumpatble_ptr_begin;
-
-									jt_addr = jumpatble_off.addr();
-
-									jt_end = segs_end;
-
-									for (const auto& seg : segs)
-									{
-										if (seg.size)
-										{
-											if (jt_addr < seg.addr + seg.size && jt_addr >= seg.addr)
-											{
-												jt_end = seg.addr + seg.size;
-												break;
-											}
-										}
-									}
-
-									jt_end = utils::align<u32>(static_cast<u32>(std::min<u64>(jt_end - 1, ctr(maxv) - 1) + 1), 4);
-
-									get_jumptable_end(jumpatble_off, jumpatble_ptr, false);
-
-									// If we do not have jump-table bounds, try manually extract reference address (last resort: may be inaccurate in theory)
-									if (jumpatble_ptr == jumpatble_ptr_begin && addr_heap.contains(_ptr.addr()))
-									{
-										// See who is referencing it
-										const u32 ref_addr = addr_heap.at(_ptr.addr());
-
-										if (ref_addr > jt_addr && ref_addr < jt_end)
-										{
-											ppu_log.todo("[0x%x] Jump table not found through GPR search, retrying using addr_heap. (iaddr=0x%x, ref_addr=0x%x)", func.addr, iaddr, ref_addr);
-
-											jumpatble_off = vm::cast(ref_addr);
-											jumpatble_ptr_begin = get_ptr<u32>(jumpatble_off);
-											jumpatble_ptr = jumpatble_ptr_begin;
-											jt_addr = ref_addr;
-
-											get_jumptable_end(jumpatble_off, jumpatble_ptr, false);
-										}
-									}
-
-									if (jumpatble_ptr != jumpatble_ptr_begin)
-									{
-										found_jt = true;
-
-										for (be_t<u32> addr : std::span<const be_t<u32>>{ jumpatble_ptr_begin , jumpatble_ptr })
-										{
-											if (addr == _ptr.addr())
-											{
-												ppu_log.success("[0x%x] Found address of next code in jump table at 0x%x! 0x%x-0x%x", func.addr, iaddr, jt_addr, jt_addr + 4 * (jumpatble_ptr - jumpatble_ptr_begin));
-												break;
-											}
-										}
-									}
-								}
-							}
 						}
 
 						if (!found_jt)
@@ -3162,32 +2585,6 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 				}
 
 				break;
-			}
-
-			if (is_good)
-			{
-				// Special opting-out: range of "instructions" is likely to be embedded floats
-				// Test this by testing if the lower 23 bits are 0
-				vm::cptr<u32> _ptr = vm::cast(exp);
-				auto ptr = get_ptr<const u32>(_ptr);
-
-				bool ok = false;
-
-				for (u32 it = exp; it < std::min(i_pos + 4, lim); it += 4, advance(_ptr, ptr, 1))
-				{
-					const u32 value_of_supposed_opcode = *ptr;
-
-					if (value_of_supposed_opcode == ppu_instructions::NOP() || (value_of_supposed_opcode << (32 - 23)))
-					{
-						ok = true;
-						break;
-					}
-				}
-
-				if (!ok)
-				{
-					is_good = false;
-				}
 			}
 
 			if (i_pos < lim)
