@@ -270,6 +270,27 @@ namespace vm
 #endif
 	}
 
+	#ifdef RPCS3_HAS_MEMORY_BREAKPOINTS
+		template <typename T, typename U = T>
+		inline void write(u32 addr, U value, ppu_thread* ppu = nullptr)
+#else
+		template <typename T, typename U = T>
+		inline void write(u32 addr, U value)
+#endif
+		{
+			_ref<T>(addr) = static_cast<T>(value);
+
+#ifdef RPCS3_HAS_MEMORY_BREAKPOINTS
+			if (ppu && g_breakpoint_handler.HasBreakpoint(addr, breakpoint_types::bp_write))
+			{
+				debugbp_log.success("BPMW: breakpoint writing(%d) 0x%x at 0x%x",
+					sizeof(T) * CHAR_BIT, value, addr);
+				ppubreak(*ppu);
+			}
+#endif
+		}
+
+
 	// Read or write virtual memory in a safe manner, returns false on failure
 	bool try_access(u32 addr, void* ptr, u32 size, bool is_write);
 
